@@ -1,4 +1,4 @@
-# Rsync time backup
+# Timba: cross-platform incremental backups with rsync
 
 This script offers Time Machine-style backup using rsync. It creates incremental backups of files and directories to the destination of your choice. The backups are structured in a way that makes it easy to recover any file at any point in time.
 
@@ -8,29 +8,37 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 
 ## Installation
 
-	git clone https://github.com/laurent22/rsync-time-backup
+	git clone https://github.com/drez3000/timba
 
 ## Usage
 
-	Usage: rsync_tmbackup.sh [OPTION]... <[USER@HOST:]SOURCE> <[USER@HOST:]DESTINATION> [exclude-pattern-file]
-
+	Usage: timba.sh [OPTION]... <[USER@HOST:]SOURCE> <[USER@HOST:]DESTINATION>
+	
 	Options
-	 -p, --port             SSH port.
-	 -h, --help             Display this help message.
-	 -i, --id_rsa           Specify the private ssh key to use.
-	 --rsync-get-flags      Display the default rsync flags that are used for backup. If using remote
-	                        drive over SSH, --compress will be added.
-	 --rsync-set-flags      Set the rsync flags that are going to be used for backup.
-	 --rsync-append-flags   Append the rsync flags that are going to be used for backup.
-	 --log-dir              Set the log file directory. If this flag is set, generated files will
-	                        not be managed by the script - in particular they will not be
-	                        automatically deleted.
-	                        Default: /home/backuper/.rsync_tmbackup
-	 --strategy             Set the expiration strategy. Default: "1:1 30:7 365:30" means after one
-	                        day, keep one backup per day. After 30 days, keep one backup every 7 days.
-	                        After 365 days keep one backup every 30 days.
-	 --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error
-	                        is logged, and the backup is aborted.
+	 -h, --help                 Display this help message.
+	 -y, --yes                  If backup destination directory doesn't exist, or isn't marked for backup,
+	                            automatically create the directory (`mkdir -p`) and mark it as backup
+	                            destination.
+	 -x, --exclude-from=        Path to an exclusion patterns file to be passed to rsync --exclude-from 
+	                            value.
+	 -p, --ssh-port=            rsync ssh port to be used.
+	 -i, --ssh-identity-file=   rsync ssh key to be used.
+	 -s, --strategy=            Set the expiration strategy. Default: "1:1 30:7 365:30" means after one
+	                            day, keep one backup per day. After 30 days, keep one backup every 7 days.
+	                            After 365 days keep one backup every 30 days.
+	 --no-auto-expire           Disable automatically deleting backups when out of space. Instead an error
+	                            is logged, and the backup is aborted.
+	 --log-dir=                 Set the log file directory. If this flag is set, generated files will
+	                            not be managed by the script - in particular they will not be
+	                            automatically deleted.
+	                            Default: $LOG_DIR
+	 --rsync-get-flags          Display the default rsync flags that are used for backup. If using remote
+	                            drive over SSH, --compress will be added.
+	 --rsync-set-flags=         Set the rsync flags that are going to be used for backup.
+	 --rsync-append-flags=      Append the rsync flags that are going to be used for backup.
+	 --ssh-get-flags            Display the default ssh flags that are used by the ssh client.
+	 --ssh-set-flags=           Set the ssh flags that are going to be used by the ssh client.
+	 --ssh-append-flags=        Append ssh flags that are going to be used by the ssh client.
 
 ## Features
 
@@ -46,32 +54,49 @@ On macOS, it has a few disadvantages compared to Time Machine - in particular it
 
 * Exclude file - support for pattern-based exclusion via the `--exclude-from` rsync parameter.
 
-* Automatically purge old backups - within 24 hours, all backups are kept. Within one month, the most recent backup for each day is kept. For all previous backups, the most recent of each month is kept.
+* Automatically purge old backups unless told otherwise - within 24 hours, all backups are kept. Within one month, the most recent backup for each day is kept. For all previous backups, the most recent of each month is kept.
 
 * "latest" symlink that points to the latest successful backup.
 
+## Changes from rsync-time-backup
+
+* Adheres to the machine SSH settings with no silent overrides. Overrides can be added explicitly with `--ssh-append-flags=`.
+
+* `--exclude-from=` is an option.
+
+* Parses arguments before options and vice-versa, eg. `timba a b --no-auto-expire` and `timba --no-auto-expire a b` both work.
+
+* Long form options for non-boolean values, eg. `--exclude-from=/path/to/exclusions/file` use an "=" suffix.
+
+* Short form options use a space suffix, eg. `-x /path/to/exclusions/file`.
+
+* All `rsync-time-backup` options are supported, but naming may be different (see [usage](#Usage)).
+
+* Default log directory is chosen according to the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/0.8/#variables).
+
+* Script is formatted with [shellcheck](https://github.com/koalaman/shellcheck).
+
 ## Examples
-	
+
 * Backup the home folder to backup_drive
 	
-		rsync_tmbackup.sh /home /mnt/backup_drive  
+		timba.sh /home /mnt/backup_drive
 
 * Backup with exclusion list:
 	
-		rsync_tmbackup.sh /home /mnt/backup_drive excluded_patterns.txt
+		timba.sh --exclude-from=excluded_patterns.txt /home /mnt/backup_drive
 
 * Backup to remote drive over SSH, on port 2222:
 
-		rsync_tmbackup.sh -p 2222 /home user@example.com:/mnt/backup_drive
-
+		timba.sh -p 2222 /home user@example.com:/mnt/backup_drive
 
 * Backup from remote drive over SSH:
 
-		rsync_tmbackup.sh user@example.com:/home /mnt/backup_drive
+		timba.sh user@example.com:/home /mnt/backup_drive
 
 * To mimic Time Machine's behaviour, a cron script can be setup to backup at regular interval. For example, the following cron job checks if the drive "/mnt/backup" is currently connected and, if it is, starts the backup. It does this check every 1 hour.
 		
-		0 */1 * * * if grep -qs /mnt/backup /proc/mounts; then rsync_tmbackup.sh /home /mnt/backup; fi
+		0 */1 * * * if grep -qs /mnt/backup /proc/mounts; then timba.sh /home /mnt/backup; fi
 
 ## Backup expiration logic
 
@@ -85,7 +110,7 @@ Before the first interval (i.e. by default within the first 24h) it is implied t
 
 ## Exclusion file
 
-An optional exclude file can be provided as a third parameter. It should be compatible with the `--exclude-from` parameter of rsync. See [this tutorial](https://web.archive.org/web/20230126121643/https://sites.google.com/site/rsync2u/home/rsync-tutorial/the-exclude-from-option) for more information.
+An optional exclude file can be provided with the option `--exclude-from=`. It should be compatible with the `--exclude-from` parameter of rsync. See [this tutorial](https://web.archive.org/web/20230126121643/https://sites.google.com/site/rsync2u/home/rsync-tutorial/the-exclude-from-option) for more information.
 
 ## Built-in lock
 
@@ -93,50 +118,23 @@ The script is designed so that only one backup operation can be active for a giv
 
 ## Rsync options
 
-To display the rsync options that are used for backup, run `./rsync_tmbackup.sh --rsync-get-flags`. It is also possible to add or remove options using the `--rsync-append-flags` or `--rsync-set-flags` option. For example, to exclude backing up permissions and groups:
+To display the rsync options that are used for backup, run `./timba.sh --rsync-get-flags`. It is also possible to add or remove options using the `--rsync-append-flags` or `--rsync-set-flags` option. For example, to exclude backing up permissions and groups:
 
-	rsync_tmbackup --rsync-append-flags "--no-perms --no-group" /src /dest
+	timba.sh --rsync-append-flags="--no-perms --no-group" /src /dest
 
 ## No automatic backup expiration
 
 An option to disable the default behaviour to purge old backups when out of space. This option is set with the `--no-auto-expire` flag.
-	
-	
+
 ## How to restore
 
 The script creates a backup in a regular directory so you can simply copy the files back to the original directory. You could do that with something like `rsync -aP /path/to/last/backup/ /path/to/restore/to/`. Consider using the `--dry-run` option to check what exactly is going to be copied. Use `--delete` if you also want to delete files that exist in the destination but not in the backup (obviously extra care must be taken when using this option).
 
-## Extensions
-
-* [rtb-wrapper](https://github.com/thomas-mc-work/rtb-wrapper): Allows creating backup profiles in config files. Handles both backup and restore operations.
-* [time-travel](https://github.com/joekerna/time-travel): Smooth integration into OSX Notification Center
-
 ## TODO
 
-* Check source and destination file-system (`df -T /dest`). If one of them is FAT, use the --modify-window rsync parameter (see `man rsync`) with a value of 1 or 2
 * Add `--whole-file` arguments on Windows? See http://superuser.com/a/905415/73619
-* Minor changes (see TODO comments in the source).
+* check that the destination supports hard links (see TODO comment in the source)
 
 ## LICENSE
 
-The MIT License (MIT)
-
-Copyright (c) 2013-2024 Laurent Cozic
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+This open source project is released under the MIT license. See the LICENSE file for details.

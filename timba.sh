@@ -1,14 +1,39 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 APPNAME=$(basename "$0" | sed "s/\.sh$//")
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
+fn_check_rsync_3_is_available() {
+	local has_rsync
+	has_rsync=$(which rsync >/dev/null 2>&1 && echo true || echo false)
+	if [[ "$has_rsync" != "true" ]]; then
+		echo "This machine doesn't appear to have rsync installed. Aborting."
+		exit 1
+	fi
+
+	local rsync_version
+	rsync_version=$(rsync --version | grep version | sed 's/protocol.*//' | sed 's/[^0-9.]//g')
+	local min_rsync_version="3.0.0"
+	if [[ $(printf "%s\n" "$rsync_version" "$min_rsync_version" | sort -V | head -n 1) != "$min_rsync_version" ]]; then
+		echo "This script requires rsync version >= $min_rsync_version. Found: $rsync_version. Aborting."
+		exit 1
+	fi
+}
+fn_check_rsync_3_is_available
 
 # -----------------------------------------------------------------------------
 # Log functions
 # -----------------------------------------------------------------------------
 
 fn_log_info()  { echo "$APPNAME: $1"; }
+
 fn_log_warn()  { echo "$APPNAME: [WARNING] $1" 1>&2; }
+
 fn_log_error() { echo "$APPNAME: [ERROR] $1" 1>&2; }
+
 fn_log_info_cmd()  {
 	if [ -n "$SSH_DEST_FOLDER_PREFIX" ]; then
 		echo "$APPNAME: $SSH_CMD '$1'";
@@ -29,32 +54,40 @@ fn_terminate_script() {
 trap 'fn_terminate_script' SIGINT
 
 # -----------------------------------------------------------------------------
-# Small utility functions for reducing code duplication
+# Utility functions
 # -----------------------------------------------------------------------------
 fn_display_usage() {
-	echo "Usage: $(basename "$0") [OPTION]... <[USER@HOST:]SOURCE> <[USER@HOST:]DESTINATION> [exclude-pattern-file]"
+	echo "Usage: $(basename "$0") [OPTION]... <[USER@HOST:]SOURCE> <[USER@HOST:]DESTINATION>"
 	echo ""
 	echo "Options"
-	echo " -p, --port             SSH port."
-	echo " -h, --help             Display this help message."
-	echo " -i, --id_rsa           Specify the private ssh key to use."
-	echo " --rsync-get-flags      Display the default rsync flags that are used for backup. If using remote"
-	echo "                        drive over SSH, --compress will be added."
-	echo " --rsync-set-flags      Set the rsync flags that are going to be used for backup."
-	echo " --rsync-append-flags   Append the rsync flags that are going to be used for backup."
-	echo " --log-dir              Set the log file directory. If this flag is set, generated files will"
-	echo "                        not be managed by the script - in particular they will not be"
-	echo "                        automatically deleted."
-	echo "                        Default: $LOG_DIR"
-	echo " --strategy             Set the expiration strategy. Default: \"1:1 30:7 365:30\" means after one"
-	echo "                        day, keep one backup per day. After 30 days, keep one backup every 7 days."
-	echo "                        After 365 days keep one backup every 30 days."
-	echo " --no-auto-expire       Disable automatically deleting backups when out of space. Instead an error"
-	echo "                        is logged, and the backup is aborted."
+	echo " -h, --help                 Display this help message."
+	echo " -y, --yes                  If backup destination directory doesn't exist, or isn't marked for backup,"
+	echo "                            automatically create the directory (\`mkdir -p\`) and mark it as backup"
+	echo "                            destination."
+	echo " -x, --exclude-from=        Path to an exclusion patterns file to be passed to rsync --exclude-from "
+	echo "                            value."
+	echo " -p, --ssh-port=            rsync ssh port to be used."
+	echo " -i, --ssh-identity-file=   rsync ssh key to be used."
+	echo " -s, --strategy=            Set the expiration strategy. Default: \"1:1 30:7 365:30\" means after one"
+	echo "                            day, keep one backup per day. After 30 days, keep one backup every 7 days."
+	echo "                            After 365 days keep one backup every 30 days."
+	echo " --no-auto-expire           Disable automatically deleting backups when out of space. Instead an error"
+	echo "                            is logged, and the backup is aborted."
+	echo " --log-dir=                 Set the log file directory. If this flag is set, generated files will"
+	echo "                            not be managed by the script - in particular they will not be"
+	echo "                            automatically deleted."
+	echo "                            Default: $LOG_DIR"
+	echo " --rsync-get-flags          Display the default rsync flags that are used for backup. If using remote"
+	echo "                            drive over SSH, --compress will be added."
+	echo " --rsync-set-flags=         Set the rsync flags that are going to be used for backup."
+	echo " --rsync-append-flags=      Append the rsync flags that are going to be used for backup."
+	echo " --ssh-get-flags            Display the default ssh flags that are used by the ssh client."
+	echo " --ssh-set-flags=           Set the ssh flags that are going to be used by the ssh client."
+	echo " --ssh-append-flags=        Append ssh flags that are going to be used by the ssh client."
 	echo ""
 	echo "For more detailed help, please see the README file:"
 	echo ""
-	echo "https://github.com/laurent22/rsync-time-backup/blob/master/README.md"
+	echo "https://github.com/drez3000/timba/blob/master/README.md"
 }
 
 fn_parse_date() {
@@ -67,18 +100,19 @@ fn_parse_date() {
 			# Under MacOS X Tiger
 			# Or with GNU 'coreutils' installed (by homebrew)
 			#   'date -j' doesn't work, so we do this:
-			yy=$(expr ${1:0:4})
-			mm=$(expr ${1:5:2} - 1)
-			dd=$(expr ${1:8:2})
-			hh=$(expr ${1:11:2})
-			mi=$(expr ${1:13:2})
-			ss=$(expr ${1:15:2})
-			perl -e 'use Time::Local; print timelocal('$ss','$mi','$hh','$dd','$mm','$yy'),"\n";' ;;
+			yy=${1:0:4}
+			mm=$(( ${1:5:2} - 1 ))
+			dd=${1:8:2}
+			hh=${1:11:2}
+			mi=${1:13:2}
+			ss=${1:15:2}
+
+			perl -e 'use Time::Local; print timelocal('"$ss"','"$mi"','"$hh"','"$dd"','"$mm"','"$yy"'),"\n";' ;;
 	esac
 }
 
 fn_find_backups() {
-	fn_run_cmd "find "$DEST_FOLDER/" -maxdepth 1 -type d -name \"????-??-??-??????\" -prune | sort -r"
+	fn_run_cmd_dest "find \"$DEST_FOLDER/\" -maxdepth 1 -type d -name \"????-??-??-??????\" -prune | sort -r"
 }
 
 fn_expire_backup() {
@@ -105,8 +139,10 @@ fn_expire_backups() {
 	# Process each backup dir from the oldest to the most recent
 	for backup_dir in $(fn_find_backups | sort); do
 
-		local backup_date=$(basename "$backup_dir")
-		local backup_timestamp=$(fn_parse_date "$backup_date")
+		local backup_date
+		local backup_timestamp
+		backup_date=$(basename "$backup_dir")
+		backup_timestamp=$(fn_parse_date "$backup_date")
 
 		# Skip if failed to parse date...
 		if [ -z "$backup_timestamp" ]; then
@@ -127,14 +163,16 @@ fn_expire_backups() {
 		fi
 
 		# Find which strategy token applies to this particular backup
-		for strategy_token in $(echo $EXPIRATION_STRATEGY | tr " " "\n" | sort -r -n); do
+		for strategy_token in $(echo "$EXPIRATION_STRATEGY" | tr " " "\n" | sort -r -n); do
 			IFS=':' read -r -a t <<< "$strategy_token"
 
 			# After which date (relative to today) this token applies (X) - we use seconds to get exact cut off time
-			local cut_off_timestamp=$((current_timestamp - ${t[0]} * 86400))
+			local cut_off_timestamp
+			cut_off_timestamp=$((current_timestamp - t[0] * 86400))
 
 			# Every how many days should a backup be kept past the cut off date (Y) - we use days (not seconds)
-			local cut_off_interval_days=$((${t[1]}))
+			local cut_off_interval_days
+			cut_off_interval_days=$((t[1]))
 
 			# If we've found the strategy token that applies to this backup
 			if [ "$backup_timestamp" -le "$cut_off_timestamp" ]; then
@@ -146,9 +184,12 @@ fn_expire_backups() {
 				fi
 
 				# we calculate days number since last kept backup
-				local last_kept_timestamp_days=$((last_kept_timestamp / 86400))
-				local backup_timestamp_days=$((backup_timestamp / 86400))
-				local interval_since_last_kept_days=$((backup_timestamp_days - last_kept_timestamp_days))
+				local last_kept_timestamp_days
+				local backup_timestamp_days
+				local interval_since_last_kept_days
+				last_kept_timestamp_days=$((last_kept_timestamp / 86400))
+				backup_timestamp_days=$((backup_timestamp / 86400))
+				interval_since_last_kept_days=$((backup_timestamp_days - last_kept_timestamp_days))
 
 				# Check if the current backup is in the interval between
 				# the last backup that was kept and Y
@@ -180,10 +221,10 @@ fn_parse_ssh() {
 		SSH_USER=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\1/')
 		SSH_HOST=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\2/')
 		SSH_DEST_FOLDER=$(echo "$DEST_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\3/')
-		if [ -n "$ID_RSA" ] ; then
-			SSH_CMD="ssh -p $SSH_PORT -i $ID_RSA ${SSH_USER}@${SSH_HOST}"
+		if [ -n "$SSH_IDENTITY" ] ; then
+			SSH_CMD="ssh -p $SSH_PORT -i $SSH_IDENTITY $SSH_FLAGS ${SSH_USER}@${SSH_HOST}"
 		else
-			SSH_CMD="ssh -p $SSH_PORT ${SSH_USER}@${SSH_HOST}"
+			SSH_CMD="ssh -p $SSH_PORT $SSH_FLAGS ${SSH_USER}@${SSH_HOST}"
 		fi
 		SSH_DEST_FOLDER_PREFIX="${SSH_USER}@${SSH_HOST}:"
 	elif echo "$SRC_FOLDER"|grep -Eq '^[A-Za-z0-9\._%\+\-]+@[A-Za-z0-9.\-]+\:.+$'
@@ -191,21 +232,21 @@ fn_parse_ssh() {
 		SSH_USER=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\1/')
 		SSH_HOST=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\2/')
 		SSH_SRC_FOLDER=$(echo "$SRC_FOLDER" | sed -E  's/^([A-Za-z0-9\._%\+\-]+)@([A-Za-z0-9.\-]+)\:(.+)$/\3/')
-		if [ -n "$ID_RSA" ] ; then
-			SSH_CMD="ssh -p $SSH_PORT -i $ID_RSA ${SSH_USER}@${SSH_HOST}"
+		if [ -n "$SSH_IDENTITY" ] ; then
+			SSH_CMD="ssh -p $SSH_PORT -i $SSH_IDENTITY $SSH_FLAGS ${SSH_USER}@${SSH_HOST}"
 		else
-			SSH_CMD="ssh -p $SSH_PORT ${SSH_USER}@${SSH_HOST}"
+			SSH_CMD="ssh -p $SSH_PORT $SSH_FLAGS ${SSH_USER}@${SSH_HOST}"
 		fi
 		SSH_SRC_FOLDER_PREFIX="${SSH_USER}@${SSH_HOST}:"
 	fi
 }
 
-fn_run_cmd() {
+fn_run_cmd_dest() {
 	if [ -n "$SSH_DEST_FOLDER_PREFIX" ]
 	then
 		eval "$SSH_CMD '$1'"
 	else
-		eval $1
+		eval "$1"
 	fi
 }
 
@@ -214,37 +255,43 @@ fn_run_cmd_src() {
 	then
 		eval "$SSH_CMD '$1'"
 	else
-		eval $1
+		eval "$1"
 	fi
 }
 
 fn_find() {
-	fn_run_cmd "find '$1'"  2>/dev/null
+	fn_run_cmd_dest "find '$1'"  2>/dev/null
 }
 
 fn_get_absolute_path() {
-	fn_run_cmd "cd '$1';pwd"
+	fn_run_cmd_dest "cd '$1';pwd"
+}
+
+fn_get_xdg_log_dir () {
+	# https://specifications.freedesktop.org/basedir-spec/0.8/#variables
+	state_home=${XDG_STATE_HOME:-"${HOME}/.local/share"}
+	echo "${state_home}/${APPNAME}/log"
 }
 
 fn_mkdir() {
-	fn_run_cmd "mkdir -p -- '$1'"
+	fn_run_cmd_dest "mkdir -p -- '$1'"
 }
 
 # Removes a file or symlink - not for directories
 fn_rm_file() {
-	fn_run_cmd "rm -f -- '$1'"
+	fn_run_cmd_dest "rm -f -- '$1'"
 }
 
 fn_rm_dir() {
-	fn_run_cmd "rm -rf -- '$1'"
+	fn_run_cmd_dest "rm -rf -- '$1'"
 }
 
 fn_touch() {
-	fn_run_cmd "touch -- '$1'"
+	fn_run_cmd_dest "touch -- '$1'"
 }
 
 fn_ln() {
-	fn_run_cmd "ln -s -- '$1' '$2'"
+	fn_run_cmd_dest "ln -s -- '$1' '$2'"
 }
 
 fn_test_file_exists_src() {
@@ -256,7 +303,7 @@ fn_df_t_src() {
 }
 
 fn_df_t() {
-	fn_run_cmd "df -T '${1}'"
+	fn_run_cmd_dest "df -T '${1}'"
 }
 
 # -----------------------------------------------------------------------------
@@ -264,68 +311,111 @@ fn_df_t() {
 # -----------------------------------------------------------------------------
 SSH_USER=""
 SSH_HOST=""
+SSH_PORT="22"
+SSH_IDENTITY=""
 SSH_DEST_FOLDER=""
 SSH_SRC_FOLDER=""
-SSH_CMD=""
 SSH_DEST_FOLDER_PREFIX=""
 SSH_SRC_FOLDER_PREFIX=""
-SSH_PORT="22"
-ID_RSA=""
+SSH_CMD=""
 
 SRC_FOLDER=""
 DEST_FOLDER=""
-EXCLUSION_FILE=""
-LOG_DIR="$HOME/.$APPNAME"
-AUTO_DELETE_LOG="1"
+EXCLUDE_FROM=""
+LOG_DIR=$(fn_get_xdg_log_dir)
+AUTO_DELETE_LOG=1
 EXPIRATION_STRATEGY="1:1 30:7 365:30"
-AUTO_EXPIRE="1"
+AUTO_EXPIRE=1
+CREATE_BACKUP_DIR=0
 
 RSYNC_FLAGS="-D --numeric-ids --links --hard-links --one-file-system --itemize-changes --times --recursive --perms --owner --group --stats --human-readable"
+SSH_FLAGS=""
 
-while :; do
-	case $1 in
+while [[ $# -gt 0 ]]; do
+	case "$1" in
 		-h|-\?|--help)
 			fn_display_usage
 			exit
 			;;
-		-p|--port)
+		-y|--yes)
+			CREATE_BACKUP_DIR=1
 			shift
-			SSH_PORT=$1
 			;;
-		-i|--id_rsa)
+		-x)
 			shift
-			ID_RSA="$1"
-			;;
-		--rsync-get-flags)
+			EXCLUDE_FROM="$1"
 			shift
-			echo "$RSYNC_FLAGS"
-			exit
 			;;
-		--rsync-set-flags)
+		--exclude-from=*)
+			EXCLUDE_FROM="${1#*=}"
 			shift
-			RSYNC_FLAGS="$1"
 			;;
-		--rsync-append-flags)
-			shift
-			RSYNC_FLAGS="$RSYNC_FLAGS $1"
-			;;
-		--strategy)
+		-s)
 			shift
 			EXPIRATION_STRATEGY="$1"
-			;;
-		--log-dir)
 			shift
-			LOG_DIR="$1"
-			AUTO_DELETE_LOG="0"
+			;;
+		--strategy=*)
+			EXPIRATION_STRATEGY="${1#*=}"
+			shift
+			;;
+		-p)
+			shift
+			SSH_PORT="$1"
+			shift
+			;;
+		--ssh-port=*)
+			SSH_PORT="${1#*=}"
+			shift
+			;;
+		-i)
+			shift
+			SSH_IDENTITY="$1"
+			shift
+			;;
+		--ssh-identity-file=*)
+			SSH_IDENTITY="${1#*=}"
+			shift
+			;;
+		--ssh-get-flags)
+			echo "$SSH_FLAGS"
+			# shift
+			exit
+			;;
+		--ssh-set-flags=*)
+			SSH_FLAGS="${1#*=}"
+			shift
+			;;
+		--ssh-append-flags=*)
+			SSH_FLAGS="$SSH_FLAGS ${1#*=}"
+			shift
+			;;
+		--rsync-get-flags)
+			echo "$RSYNC_FLAGS"
+			# shift
+			exit
+			;;
+		--rsync-set-flags=*)
+			RSYNC_FLAGS="${1#*=}"
+			shift
+			;;
+		--rsync-append-flags=*)
+			RSYNC_FLAGS="$RSYNC_FLAGS ${1#*=}"
+			shift
+			;;
+		--log-dir=*)
+			LOG_DIR="${1#*=}"
+			AUTO_DELETE_LOG=0
+			shift
 			;;
 		--no-auto-expire)
-			AUTO_EXPIRE="0"
+			AUTO_EXPIRE=0
+			shift
 			;;
 		--)
 			shift
 			SRC_FOLDER="$1"
 			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
 			break
 			;;
 		-*)
@@ -335,13 +425,19 @@ while :; do
 			exit 1
 			;;
 		*)
-			SRC_FOLDER="$1"
-			DEST_FOLDER="$2"
-			EXCLUSION_FILE="$3"
-			break
+			if [[ -z "$SRC_FOLDER" ]]; then
+				SRC_FOLDER="$1"
+			elif [[ -z "$DEST_FOLDER" ]]; then
+				DEST_FOLDER="$1"
+			else
+				fn_log_error "Too many positional arguments."
+				fn_log_info ""
+				fn_display_usage
+				exit 1
+			fi
+			shift
+			;;
 	esac
-
-	shift
 done
 
 # Display usage information if required arguments are not passed
@@ -378,7 +474,7 @@ fi
 # Now strip off last slash from source folder.
 SRC_FOLDER="${SRC_FOLDER%/}"
 
-for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUSION_FILE"; do
+for ARG in "$SRC_FOLDER" "$DEST_FOLDER" "$EXCLUDE_FROM"; do
 	if [[ "$ARG" == *"'"* ]]; then
 		fn_log_error 'Source and destination directories may not contain single quote characters.'
 		exit 1
@@ -392,15 +488,21 @@ done
 # TODO: check that the destination supports hard links
 
 fn_backup_marker_path() { echo "$1/backup.marker"; }
-fn_find_backup_marker() { fn_find "$(fn_backup_marker_path "$1")" 2>/dev/null; }
+fn_find_backup_marker() { fn_find "$(fn_backup_marker_path \""$1"\")" 2>/dev/null; }
 
-if [ -z "$(fn_find_backup_marker "$DEST_FOLDER")" ]; then
+MARKER_PATH=$(fn_backup_marker_path "$DEST_FOLDER" || true)
+MARKER_FOUND=$(fn_find_backup_marker "$DEST_FOLDER" || true)
+if [[ -z "$MARKER_FOUND" && "$CREATE_BACKUP_DIR" == 0 ]]; then
 	fn_log_info "Safety check failed - the destination does not appear to be a backup folder or drive (marker file not found)."
-	fn_log_info "If it is indeed a backup folder, you may add the marker file by running the following command:"
+	fn_log_info "If it is indeed a backup folder, you may run this command again adding the --yes flag,"
+	fn_log_info "or manually add the marker file with:"
 	fn_log_info ""
-	fn_log_info_cmd "mkdir -p -- \"$DEST_FOLDER\" ; touch \"$(fn_backup_marker_path "$DEST_FOLDER")\""
+	fn_log_info_cmd "mkdir -p -- \"$DEST_FOLDER\" ; touch \"$MARKER_PATH\""
 	fn_log_info ""
 	exit 1
+elif [[ -z "$MARKER_FOUND" && "$CREATE_BACKUP_DIR" == 1 ]]; then
+	fn_run_cmd_dest "mkdir -p -- \"$DEST_FOLDER\""
+	fn_run_cmd_dest "touch \"$MARKER_PATH\""
 fi
 
 # Check source and destination file-system (df -T /dest).
@@ -426,8 +528,6 @@ fi
 # Date logic
 NOW=$(date +"%Y-%m-%d-%H%M%S")
 EPOCH=$(date "+%s")
-KEEP_ALL_DATE=$((EPOCH - 86400))       # 1 day ago
-KEEP_DAILIES_DATE=$((EPOCH - 2678400)) # 31 days ago
 
 export IFS=$'\n' # Better for handling spaces in filenames.
 DEST="$DEST_FOLDER/$NOW"
@@ -441,7 +541,7 @@ MYPID="$$"
 
 if [ ! -d "$LOG_DIR" ]; then
 	fn_log_info "Creating log folder in '$LOG_DIR'..."
-	mkdir -- "$LOG_DIR"
+	mkdir -p "$LOG_DIR"
 fi
 
 # -----------------------------------------------------------------------------
@@ -451,10 +551,10 @@ fi
 if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
 	if [ "$OSTYPE" == "cygwin" ]; then
 		# 1. Grab the PID of previous run from the PID file
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
+		RUNNINGPID="$(fn_run_cmd_dest "cat $INPROGRESS_FILE")"
 
 		# 2. Get the command for the process currently running under that PID and look for our script name
-		RUNNINGCMD="$(procps -wwfo cmd -p $RUNNINGPID --no-headers | grep "$APPNAME")"
+		RUNNINGCMD="$(procps -wwfo cmd -p "$RUNNINGPID" --no-headers | grep "$APPNAME")"
 
 		# 3. Grab the exit code from grep (0=found, 1=not found)
 		GREPCODE=$?
@@ -465,13 +565,13 @@ if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
 			exit 1
 		fi
 	elif [[ "$OSTYPE" == "netbsd"* ]]; then
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
+		RUNNINGPID="$(fn_run_cmd_dest "cat $INPROGRESS_FILE")"
 		if ps -axp "$RUNNINGPID" -o "command" | grep "$APPNAME" > /dev/null; then
 			fn_log_error "Previous backup task is still active - aborting."
 			exit 1
 		fi
 	else
-		RUNNINGPID="$(fn_run_cmd "cat $INPROGRESS_FILE")"
+		RUNNINGPID="$(fn_run_cmd_dest "cat $INPROGRESS_FILE")"
 		if ps -p "$RUNNINGPID" -o command | grep "$APPNAME"
 		then
 			fn_log_error "Previous backup task is still active - aborting."
@@ -483,14 +583,14 @@ if [ -n "$(fn_find "$INPROGRESS_FILE")" ]; then
 		# - Last backup is moved to current backup folder so that it can be resumed.
 		# - 2nd to last backup becomes last backup.
 		fn_log_info "$SSH_DEST_FOLDER_PREFIX$INPROGRESS_FILE already exists - the previous backup failed or was interrupted. Backup will resume from there."
-		fn_run_cmd "mv -- $PREVIOUS_DEST $DEST"
+		fn_run_cmd_dest "mv -- $PREVIOUS_DEST $DEST"
 		if [ "$(fn_find_backups | wc -l)" -gt 1 ]; then
 			PREVIOUS_DEST="$(fn_find_backups | sed -n '2p')"
 		else
 			PREVIOUS_DEST=""
 		fi
 		# update PID to current process to avoid multiple concurrent resumes
-		fn_run_cmd "echo $MYPID > $INPROGRESS_FILE"
+		fn_run_cmd_dest "echo $MYPID > $INPROGRESS_FILE"
 	fi
 fi
 
@@ -537,6 +637,8 @@ while : ; do
 	# Start backup
 	# -----------------------------------------------------------------------------
 
+	EXIT_CODE=0
+	NO_SPACE_LEFT=0
 	LOG_FILE="$LOG_DIR/$(date +"%Y-%m-%d-%H%M%S").log"
 
 	fn_log_info "Starting backup..."
@@ -546,36 +648,43 @@ while : ; do
 	CMD="rsync"
 	if [ -n "$SSH_CMD" ]; then
 		RSYNC_FLAGS="$RSYNC_FLAGS --compress"
-		if [ -n "$ID_RSA" ] ; then
-			CMD="$CMD  -e 'ssh -p $SSH_PORT -i $ID_RSA -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+		if [ -n "$SSH_IDENTITY" ] ; then
+			CMD="$CMD -e 'ssh -p $SSH_PORT -i $SSH_IDENTITY $SSH_FLAGS'"
 		else
-			CMD="$CMD  -e 'ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+			CMD="$CMD -e 'ssh -p $SSH_PORT $SSH_FLAGS'"
 		fi
 	fi
 	CMD="$CMD $RSYNC_FLAGS"
 	CMD="$CMD --log-file '$LOG_FILE'"
-	if [ -n "$EXCLUSION_FILE" ]; then
-		# We've already checked that $EXCLUSION_FILE doesn't contain a single quote
-		CMD="$CMD --exclude-from '$EXCLUSION_FILE'"
+	if [ -n "$EXCLUDE_FROM" ]; then
+		# We've already checked that $EXCLUDE_FROM doesn't contain a single quote
+		CMD="$CMD --exclude-from '$EXCLUDE_FROM'"
 	fi
 	CMD="$CMD $LINK_DEST_OPTION"
 	CMD="$CMD -- '$SSH_SRC_FOLDER_PREFIX$SRC_FOLDER/' '$SSH_DEST_FOLDER_PREFIX$DEST/'"
 
-	fn_log_info "Running command:"
-	fn_log_info "$CMD"
+	# -----------------------------------------------------------------------------
+	# Run rsync
+	# -----------------------------------------------------------------------------
 
-	fn_run_cmd "echo $MYPID > $INPROGRESS_FILE"
-	eval $CMD
+	if [[ "$EXIT_CODE" != 1 && "$NO_SPACE_LEFT" == 0 ]]; then
+		fn_log_info "Running command:"
+		fn_log_info "$CMD"
+		fn_run_cmd_dest "echo $MYPID > $INPROGRESS_FILE"
+		eval "$CMD"
+	fi
 
 	# -----------------------------------------------------------------------------
 	# Check if we ran out of space
 	# -----------------------------------------------------------------------------
 
-	NO_SPACE_LEFT="$(grep "No space left on device (28)\|Result too large (34)" "$LOG_FILE")"
+	no_space_logged=$(cat "$LOG_FILE" | grep "No space left on device (28)\|Result too large (34)" || true)
+	if [[ -n "$no_space_logged" ]]; then
+		NO_SPACE_LEFT=1
+	fi
+	if [[ "$EXIT_CODE" != 1 && "$NO_SPACE_LEFT" == 1 ]]; then
 
-	if [ -n "$NO_SPACE_LEFT" ]; then
-
-		if [[ $AUTO_EXPIRE == "0" ]]; then
+		if [[ "$AUTO_EXPIRE" == 0 ]]; then
 			fn_log_error "No space left on device, and automatic purging of old backups is disabled."
 			exit 1
 		fi
@@ -597,23 +706,24 @@ while : ; do
 	# Check whether rsync reported any errors
 	# -----------------------------------------------------------------------------
 
-	EXIT_CODE="1"
-	if [ -n "$(grep "rsync error:" "$LOG_FILE")" ]; then
+	if grep -q "rsync error:" "$LOG_FILE"; then
 		fn_log_error "Rsync reported an error. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
-	elif [ -n "$(grep "rsync:" "$LOG_FILE")" ]; then
+		EXIT_CODE=1
+	elif grep -q "rsync:" "$LOG_FILE"; then
 		fn_log_warn "Rsync reported a warning. Run this command for more details: grep -E 'rsync:|rsync error:' '$LOG_FILE'"
+		EXIT_CODE=1
 	else
 		fn_log_info "Backup completed without errors."
-		if [[ $AUTO_DELETE_LOG == "1" ]]; then
+		if [[ "$AUTO_DELETE_LOG" == 1 ]]; then
 			rm -f -- "$LOG_FILE"
 		fi
-		EXIT_CODE="0"
 	fi
 
 	# -----------------------------------------------------------------------------
 	# Add symlink to last backup
 	# -----------------------------------------------------------------------------
-	if [ "$EXIT_CODE" = 0 ]; then
+
+	if [[ "$EXIT_CODE" == 0 ]]; then
 		# Create the latest symlink only when rsync succeeded
 		fn_rm_file "$DEST_FOLDER/latest"
 		fn_ln "$(basename -- "$DEST")" "$DEST_FOLDER/latest"

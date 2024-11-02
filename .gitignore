@@ -1,5 +1,4 @@
 .idea
 test.sh
 *~
-tests/TestDest/
-tests/TestSource/
+.DS_Store
